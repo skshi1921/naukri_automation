@@ -3,12 +3,14 @@ import time
 import random
 import smtplib
 import logging
+import threading
 from datetime import datetime
 from email.mime.text import MIMEText
 
-from flask import Flask
+from flask import Flask, request, jsonify, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -25,15 +27,48 @@ NAUKRI_EMAIL = os.environ.get("NAUKRI_EMAIL")
 NAUKRI_PASSWORD = os.environ.get("NAUKRI_PASSWORD")
 RESUME_PATH = os.environ.get("RESUME_PATH", "/opt/render/project/src/resume.pdf")
 
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")       # your gmail id
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")            # your gmail id
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")  # 16-char app password
-NOTIFY_TO = os.environ.get("NOTIFY_TO", GMAIL_ADDRESS)      # where alert email goes
+NOTIFY_TO = os.environ.get("NOTIFY_TO", GMAIL_ADDRESS)     # where alert email goes
+
+# Secret token to protect action routes (trigger / pause / resume).
+# Set this in Render env vars to something random. Without the correct
+# token these actions refuse to run, so a stranger who finds your URL
+# can't mess with your automation or your Naukri account.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+PROFILE_URL = "https://www.naukri.com/mnjuser/profile?id=&altresid"
 
 # Window inside which the daily job time is randomized (24h format, minutes)
 WINDOW_START_MIN = 8 * 60 + 50   # 8:50 AM
 WINDOW_END_MIN = 9 * 60 + 20     # 9:20 AM
 
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+
+# Whether the daily automation is currently active (resets to True on restart/redeploy)
+automation_enabled = True
+
+# ---------- LIVE STATUS TRACKING (used by the dashboard) ----------
+job_status_lock = threading.Lock()
+job_status = {
+    "state": "idle",          # idle | running | success | failed
+    "logged_in": False,
+    "resume_uploaded": False,
+    "completed": False,
+    "message": "No run yet.",
+    "last_run": None,
+    "triggered_by": None,     # "manual" or "scheduled"
+}
+
+
+def update_status(**kwargs):
+    with job_status_lock:
+        job_status.update(kwargs)
+
+
+def get_status():
+    with job_status_lock:
+        return dict(job_status)
 
 
 # ---------- EMAIL ----------
@@ -55,17 +90,29 @@ def send_email(subject: str, body: str):
 
 
 # ---------- CORE REFRESH JOB ----------
-def refresh_naukri_profile():
+def refresh_naukri_profile(triggered_by="scheduled"):
     """
     Logs into Naukri and re-uploads the same resume file to bump the
     'last updated' timestamp, which pushes the profile up in recruiter search.
 
-    NOTE: The element selectors below (By.ID / By.XPATH values) are best-effort
-    guesses based on Naukri's typical DOM structure. Naukri changes its frontend
-    periodically, so you MUST verify these selectors yourself via browser
-    DevTools (right-click element -> Inspect) before first real run, and update
-    them if they don't match. Search for 'VERIFY THIS' comments below.
+    Selectors were verified against actual page markup on 2026-08-07.
+    Naukri can change its frontend at any time — if this starts failing
+    with TimeoutException, re-check the elements in DevTools again.
     """
+    if not automation_enabled:
+        log.info("Automation is paused — skipping this run.")
+        update_status(state="idle", message="Automation is paused, run skipped.")
+        return
+
+    update_status(
+        state="running",
+        logged_in=False,
+        resume_uploaded=False,
+        completed=False,
+        message="Starting browser and logging in...",
+        triggered_by=triggered_by,
+    )
+
     driver = None
     try:
         options = uc.ChromeOptions()
@@ -80,17 +127,20 @@ def refresh_naukri_profile():
         driver.get("https://www.naukri.com/nlogin/login")
         time.sleep(random.uniform(2, 4))
 
-        # VERIFY THIS: login field IDs
-        email_field = wait.until(EC.presence_of_element_located((By.ID, "usernameField")))
+        # Email / Username field — matched via aria-label (no stable id/name present)
+        email_field = wait.until(
+            EC.presence_of_element_located((By.XPATH, "//input[@aria-label='Email ID / Username']"))
+        )
         email_field.send_keys(NAUKRI_EMAIL)
         time.sleep(random.uniform(0.5, 1.5))
 
-        password_field = driver.find_element(By.ID, "passwordField")
+        # Password field — matched via aria-label
+        password_field = driver.find_element(By.XPATH, "//input[@aria-label='Password']")
         password_field.send_keys(NAUKRI_PASSWORD)
         time.sleep(random.uniform(0.5, 1.5))
 
-        # VERIFY THIS: login submit button
-        login_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
+        # Login button — has class "loginButton"
+        login_btn = driver.find_element(By.CSS_SELECTOR, "button.loginButton")
         login_btn.click()
 
         # Wait for dashboard to load
@@ -102,23 +152,37 @@ def refresh_naukri_profile():
             raise RuntimeError("CAPTCHA encountered during login — cannot proceed automatically")
 
         log.info("Login successful, navigating to profile")
-        driver.get("https://www.naukri.com/mnjuser/profile")
-        time.sleep(random.uniform(2, 4))
+        update_status(logged_in=True, message="Logged in. Opening profile page...")
 
+        driver.get(PROFILE_URL)
+        time.sleep(random.uniform(2, 4))
         driver.execute_script("window.scrollBy(0, 600);")
         time.sleep(random.uniform(1, 2))
 
-        # VERIFY THIS: resume upload input — usually a hidden <input type='file'>
+        # Resume upload input — hidden <input type="file"> inside
+        # <div class="resume-upload-container">. Targeting via the container's
+        # class is more robust than the id (which looked auto-generated).
         upload_input = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, ".resume-upload-container input[type='file']")
+            )
         )
+
         if not os.path.isfile(RESUME_PATH):
             raise FileNotFoundError(f"Resume file not found at {RESUME_PATH}")
 
+        update_status(message="Uploading resume...")
         upload_input.send_keys(RESUME_PATH)
         time.sleep(random.uniform(3, 6))
 
         log.info("Resume re-uploaded successfully — profile refreshed")
+        update_status(
+            resume_uploaded=True,
+            state="success",
+            completed=True,
+            message="Profile refreshed successfully.",
+            last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
         send_email(
             "Naukri profile refresh: SUCCESS",
             f"Profile refreshed successfully at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST.",
@@ -126,6 +190,12 @@ def refresh_naukri_profile():
 
     except TimeoutException as e:
         log.error("Timeout waiting for element: %s", e)
+        update_status(
+            state="failed",
+            completed=False,
+            message=f"Timed out waiting for a page element: {e}",
+            last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
         send_email(
             "Naukri profile refresh: FAILED (timeout)",
             f"Timed out waiting for a page element. This usually means Naukri's page "
@@ -133,6 +203,12 @@ def refresh_naukri_profile():
         )
     except Exception as e:
         log.error("Refresh job failed: %s", e)
+        update_status(
+            state="failed",
+            completed=False,
+            message=f"Failed: {e}",
+            last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
         send_email(
             "Naukri profile refresh: FAILED",
             f"Automation failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST.\n\n"
@@ -156,7 +232,7 @@ def schedule_next_run():
     minute = minute_offset % 60
 
     scheduler.add_job(
-        refresh_naukri_profile,
+        lambda: refresh_naukri_profile(triggered_by="scheduled"),
         trigger=CronTrigger(hour=hour, minute=minute, timezone="Asia/Kolkata"),
         id="daily_refresh",
         replace_existing=True,
@@ -166,9 +242,7 @@ def schedule_next_run():
 
 
 def init_scheduler():
-    # Pick today's random time immediately on startup
     schedule_next_run()
-    # Every midnight, pick a new random time for the coming day
     scheduler.add_job(
         schedule_next_run,
         trigger=CronTrigger(hour=0, minute=1, timezone="Asia/Kolkata"),
@@ -181,19 +255,241 @@ def init_scheduler():
 init_scheduler()
 
 
+# ---------- ADMIN AUTH HELPER ----------
+def check_token():
+    """True if request has a valid admin token, or none is configured (open mode)."""
+    if not ADMIN_TOKEN:
+        return True
+    supplied = request.args.get("token") or (request.json or {}).get("token") if request.is_json else request.args.get("token")
+    return supplied == ADMIN_TOKEN
+
+
+# ---------- DASHBOARD (frontend) ----------
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Naukri Auto-Refresher</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f172a; color: #e2e8f0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    background: #1e293b; border-radius: 16px; padding: 32px; width: 100%; max-width: 440px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 24px; }
+  .steps { display: flex; flex-direction: column; gap: 14px; margin-bottom: 24px; }
+  .step {
+    display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+    background: #0f172a; border-radius: 10px; border: 1px solid #334155;
+  }
+  .box {
+    width: 22px; height: 22px; border-radius: 6px; border: 2px solid #475569;
+    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 14px; transition: all 0.2s;
+  }
+  .box.checked { background: #22c55e; border-color: #22c55e; color: #0f172a; font-weight: bold; }
+  .box.failed { background: #ef4444; border-color: #ef4444; color: #fff; }
+  .step-label { font-size: 14px; }
+  button {
+    width: 100%; padding: 14px; border-radius: 10px; border: none; font-size: 15px;
+    font-weight: 600; cursor: pointer; margin-bottom: 10px; transition: opacity 0.2s;
+  }
+  #runBtn { background: #6366f1; color: white; }
+  #runBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; }
+  .row button { flex: 1; }
+  #pauseBtn { background: #f59e0b; color: #0f172a; }
+  #resumeBtn { background: #22c55e; color: #0f172a; }
+  .status-msg {
+    font-size: 13px; color: #cbd5e1; text-align: center; margin: 14px 0 4px;
+    min-height: 18px;
+  }
+  .meta { font-size: 12px; color: #64748b; text-align: center; margin-top: 8px; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 3px 8px; border-radius: 999px;
+    margin-left: 8px; vertical-align: middle;
+  }
+  .badge.on { background: #14532d; color: #86efac; }
+  .badge.off { background: #7c2d12; color: #fdba74; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Naukri Auto-Refresher <span id="autoBadge" class="badge"></span></h1>
+    <div class="sub">Manual run + live status</div>
+
+    <div class="steps">
+      <div class="step">
+        <div id="box-login" class="box">1</div>
+        <div class="step-label">Logged in to Naukri</div>
+      </div>
+      <div class="step">
+        <div id="box-upload" class="box">2</div>
+        <div class="step-label">Resume uploaded</div>
+      </div>
+      <div class="step">
+        <div id="box-complete" class="box">3</div>
+        <div class="step-label">Task complete</div>
+      </div>
+    </div>
+
+    <button id="runBtn" onclick="triggerRun()">Run Now</button>
+    <div class="row">
+      <button id="pauseBtn" onclick="callAction('/api/pause')">Pause Daily Job</button>
+      <button id="resumeBtn" onclick="callAction('/api/resume')">Resume Daily Job</button>
+    </div>
+
+    <div class="status-msg" id="statusMsg">Loading status...</div>
+    <div class="meta" id="lastRun"></div>
+  </div>
+
+<script>
+function getToken() {
+  let t = localStorage.getItem('naukri_admin_token');
+  if (t === null) {
+    t = prompt("Enter admin token (leave blank if none configured):") || "";
+    localStorage.setItem('naukri_admin_token', t);
+  }
+  return t;
+}
+
+function setBox(id, state) {
+  const el = document.getElementById(id);
+  el.classList.remove('checked', 'failed');
+  if (state === 'ok') { el.classList.add('checked'); el.textContent = '✓'; }
+  else if (state === 'fail') { el.classList.add('failed'); el.textContent = '✗'; }
+  else { el.textContent = ''; }
+}
+
+async function refreshStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    const s = data.job_status;
+
+    setBox('box-login', s.logged_in ? 'ok' : (s.state === 'failed' && !s.logged_in ? 'fail' : ''));
+    setBox('box-upload', s.resume_uploaded ? 'ok' : (s.state === 'failed' && s.logged_in && !s.resume_uploaded ? 'fail' : ''));
+    setBox('box-complete', s.completed ? 'ok' : (s.state === 'failed' ? 'fail' : ''));
+
+    document.getElementById('statusMsg').textContent = s.message || '';
+    document.getElementById('lastRun').textContent = s.last_run ? ('Last run: ' + s.last_run + ' IST (' + (s.triggered_by || '') + ')') : '';
+
+    const badge = document.getElementById('autoBadge');
+    badge.textContent = data.automation_enabled ? 'Daily job: ON' : 'Daily job: PAUSED';
+    badge.className = 'badge ' + (data.automation_enabled ? 'on' : 'off');
+
+    document.getElementById('runBtn').disabled = (s.state === 'running');
+    document.getElementById('runBtn').textContent = (s.state === 'running') ? 'Running...' : 'Run Now';
+  } catch (e) {
+    document.getElementById('statusMsg').textContent = 'Could not reach server.';
+  }
+}
+
+async function triggerRun() {
+  await callAction('/api/trigger');
+}
+
+async function callAction(path) {
+  const token = getToken();
+  try {
+    const res = await fetch(path + '?token=' + encodeURIComponent(token));
+    const data = await res.json();
+    if (res.status === 401) {
+      alert('Wrong token. Clearing saved token — try again.');
+      localStorage.removeItem('naukri_admin_token');
+    }
+  } catch (e) {}
+  refreshStatus();
+}
+
+refreshStatus();
+setInterval(refreshStatus, 2000);
+</script>
+</body>
+</html>
+"""
+
+
 # ---------- ROUTES ----------
 @app.route("/")
-def health():
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+
+@app.route("/api/status")
+def api_status():
     jobs = scheduler.get_jobs()
     next_runs = {job.id: str(job.next_run_time) for job in jobs}
-    return {"status": "running", "scheduled_jobs": next_runs}
+    return jsonify({
+        "automation_enabled": automation_enabled,
+        "scheduled_jobs": next_runs,
+        "job_status": get_status(),
+    })
 
 
+@app.route("/api/trigger")
+def api_trigger():
+    """Manual run, triggered from the dashboard button (or directly via URL + token)."""
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+    current = get_status()
+    if current["state"] == "running":
+        return jsonify({"status": "already running"})
+    scheduler.add_job(
+        lambda: refresh_naukri_profile(triggered_by="manual"),
+        id="manual_trigger",
+        replace_existing=True,
+    )
+    return jsonify({"status": "triggered manually, watch the dashboard for progress"})
+
+
+@app.route("/api/pause")
+def api_pause():
+    """Pauses the daily automation without touching the running web service."""
+    global automation_enabled
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+    automation_enabled = False
+    if scheduler.get_job("daily_refresh"):
+        scheduler.remove_job("daily_refresh")
+    log.info("Automation paused via /api/pause")
+    return jsonify({"status": "paused"})
+
+
+@app.route("/api/resume")
+def api_resume():
+    """Re-enables the daily automation and reschedules the next run."""
+    global automation_enabled
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+    automation_enabled = True
+    schedule_next_run()
+    log.info("Automation resumed via /api/resume")
+    return jsonify({"status": "resumed"})
+
+
+# ---- Old route names kept as aliases, in case anything (e.g. UptimeRobot) still points to them ----
 @app.route("/trigger-now")
-def trigger_now():
-    """Manual test endpoint — hit this URL to run the refresh immediately."""
-    scheduler.add_job(refresh_naukri_profile, id="manual_trigger", replace_existing=True)
-    return {"status": "triggered manually, check email for result"}
+def trigger_now_alias():
+    return api_trigger()
+
+
+@app.route("/pause")
+def pause_alias():
+    return api_pause()
+
+
+@app.route("/resume")
+def resume_alias():
+    return api_resume()
 
 
 if __name__ == "__main__":
