@@ -1,20 +1,18 @@
 services:
   - type: web
     name: naukri-refresher
-    env: python
-    buildCommand: "apt-get update && apt-get install -y chromium chromium-driver && pip install -r requirements.txt"
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120"
+    env: docker
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: NAUKRI_EMAIL
         sync: false
       - key: NAUKRI_PASSWORD
         sync: false
-      - key: RESUME_PATH
-        value: /opt/render/project/src/resume.pdf
       - key: GMAIL_ADDRESS
         sync: false
       - key: GMAIL_APP_PASSWORD
         sync: false
       - key: NOTIFY_TO
         sync: false
- 
+      - key: ADMIN_TOKEN
+        sync: false
