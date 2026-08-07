@@ -22,42 +22,33 @@ log = logging.getLogger("naukri-refresher")
 
 app = Flask(__name__)
 
-# ---------- CONFIG (from environment variables, set these in Render dashboard) ----------
 NAUKRI_EMAIL = os.environ.get("NAUKRI_EMAIL")
 NAUKRI_PASSWORD = os.environ.get("NAUKRI_PASSWORD")
-RESUME_PATH = os.environ.get("RESUME_PATH", "/opt/render/project/src/resume.pdf")
+RESUME_PATH = os.environ.get("RESUME_PATH", "/app/resume.pdf")
 
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")            # your gmail id
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")  # 16-char app password
-NOTIFY_TO = os.environ.get("NOTIFY_TO", GMAIL_ADDRESS)     # where alert email goes
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+NOTIFY_TO = os.environ.get("NOTIFY_TO", GMAIL_ADDRESS)
 
-# Secret token to protect action routes (trigger / pause / resume).
-# Set this in Render env vars to something random. Without the correct
-# token these actions refuse to run, so a stranger who finds your URL
-# can't mess with your automation or your Naukri account.
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
 
 PROFILE_URL = "https://www.naukri.com/mnjuser/profile?id=&altresid"
 
-# Window inside which the daily job time is randomized (24h format, minutes)
-WINDOW_START_MIN = 8 * 60 + 50   # 8:50 AM
-WINDOW_END_MIN = 9 * 60 + 20     # 9:20 AM
+WINDOW_START_MIN = 8 * 60 + 50
+WINDOW_END_MIN = 9 * 60 + 20
 
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
-
-# Whether the daily automation is currently active (resets to True on restart/redeploy)
 automation_enabled = True
 
-# ---------- LIVE STATUS TRACKING (used by the dashboard) ----------
 job_status_lock = threading.Lock()
 job_status = {
-    "state": "idle",          # idle | running | success | failed
+    "state": "idle",
     "logged_in": False,
     "resume_uploaded": False,
     "completed": False,
     "message": "No run yet.",
     "last_run": None,
-    "triggered_by": None,     # "manual" or "scheduled"
+    "triggered_by": None,
 }
 
 
@@ -71,7 +62,6 @@ def get_status():
         return dict(job_status)
 
 
-# ---------- EMAIL ----------
 def send_email(subject: str, body: str):
     if not (GMAIL_ADDRESS and GMAIL_APP_PASSWORD and NOTIFY_TO):
         log.warning("Email not configured, skipping notification. Subject: %s", subject)
@@ -89,16 +79,7 @@ def send_email(subject: str, body: str):
         log.error("Failed to send email: %s", e)
 
 
-# ---------- CORE REFRESH JOB ----------
 def refresh_naukri_profile(triggered_by="scheduled"):
-    """
-    Logs into Naukri and re-uploads the same resume file to bump the
-    'last updated' timestamp, which pushes the profile up in recruiter search.
-
-    Selectors were verified against actual page markup on 2026-08-07.
-    Naukri can change its frontend at any time — if this starts failing
-    with TimeoutException, re-check the elements in DevTools again.
-    """
     if not automation_enabled:
         log.info("Automation is paused — skipping this run.")
         update_status(state="idle", message="Automation is paused, run skipped.")
@@ -120,6 +101,7 @@ def refresh_naukri_profile(triggered_by="scheduled"):
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1366,768")
+        options.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
         driver = uc.Chrome(options=options)
         wait = WebDriverWait(driver, 20)
 
@@ -127,27 +109,22 @@ def refresh_naukri_profile(triggered_by="scheduled"):
         driver.get("https://www.naukri.com/nlogin/login")
         time.sleep(random.uniform(2, 4))
 
-        # Email / Username field — matched via aria-label (no stable id/name present)
         email_field = wait.until(
             EC.presence_of_element_located((By.XPATH, "//input[@aria-label='Email ID / Username']"))
         )
         email_field.send_keys(NAUKRI_EMAIL)
         time.sleep(random.uniform(0.5, 1.5))
 
-        # Password field — matched via aria-label
         password_field = driver.find_element(By.XPATH, "//input[@aria-label='Password']")
         password_field.send_keys(NAUKRI_PASSWORD)
         time.sleep(random.uniform(0.5, 1.5))
 
-        # Login button — has class "loginButton"
         login_btn = driver.find_element(By.CSS_SELECTOR, "button.loginButton")
         login_btn.click()
 
-        # Wait for dashboard to load
         wait.until(EC.url_contains("naukri.com/mnjuser"))
         time.sleep(random.uniform(3, 5))
 
-        # Check for CAPTCHA / unexpected redirect
         if "captcha" in driver.current_url.lower():
             raise RuntimeError("CAPTCHA encountered during login — cannot proceed automatically")
 
@@ -159,9 +136,6 @@ def refresh_naukri_profile(triggered_by="scheduled"):
         driver.execute_script("window.scrollBy(0, 600);")
         time.sleep(random.uniform(1, 2))
 
-        # Resume upload input — hidden <input type="file"> inside
-        # <div class="resume-upload-container">. Targeting via the container's
-        # class is more robust than the id (which looked auto-generated).
         upload_input = wait.until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, ".resume-upload-container input[type='file']")
@@ -219,14 +193,7 @@ def refresh_naukri_profile(triggered_by="scheduled"):
             driver.quit()
 
 
-# ---------- DAILY RE-SCHEDULING WITH RANDOM TIME ----------
 def schedule_next_run():
-    """
-    Picks a random time within the configured window for TODAY's run,
-    removes any previous job, and schedules a fresh one-off job.
-    Then schedules itself again for the next day at midnight to pick a new
-    random time — this way the exact minute changes every day.
-    """
     minute_offset = random.randint(WINDOW_START_MIN, WINDOW_END_MIN)
     hour = minute_offset // 60
     minute = minute_offset % 60
@@ -255,16 +222,13 @@ def init_scheduler():
 init_scheduler()
 
 
-# ---------- ADMIN AUTH HELPER ----------
 def check_token():
-    """True if request has a valid admin token, or none is configured (open mode)."""
     if not ADMIN_TOKEN:
         return True
     supplied = request.args.get("token") or (request.json or {}).get("token") if request.is_json else request.args.get("token")
     return supplied == ADMIN_TOKEN
 
 
-# ---------- DASHBOARD (frontend) ----------
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -418,7 +382,6 @@ setInterval(refreshStatus, 2000);
 """
 
 
-# ---------- ROUTES ----------
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -437,7 +400,6 @@ def api_status():
 
 @app.route("/api/trigger")
 def api_trigger():
-    """Manual run, triggered from the dashboard button (or directly via URL + token)."""
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
     current = get_status()
@@ -453,7 +415,6 @@ def api_trigger():
 
 @app.route("/api/pause")
 def api_pause():
-    """Pauses the daily automation without touching the running web service."""
     global automation_enabled
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
@@ -466,7 +427,6 @@ def api_pause():
 
 @app.route("/api/resume")
 def api_resume():
-    """Re-enables the daily automation and reschedules the next run."""
     global automation_enabled
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
@@ -476,7 +436,6 @@ def api_resume():
     return jsonify({"status": "resumed"})
 
 
-# ---- Old route names kept as aliases, in case anything (e.g. UptimeRobot) still points to them ----
 @app.route("/trigger-now")
 def trigger_now_alias():
     return api_trigger()
