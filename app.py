@@ -79,6 +79,31 @@ def send_email(subject: str, body: str):
         log.error("Failed to send email: %s", e)
 
 
+DEBUG_DIR = "/app/debug"
+
+
+def capture_debug(driver):
+    """
+    Saves a screenshot + page HTML of whatever the browser was looking at
+    when a failure happened, so we can see if it was a selector mismatch,
+    a CAPTCHA, or something else Naukri served instead of the expected page.
+    """
+    info = {"url": None, "title": None, "screenshot_saved": False}
+    if not driver:
+        return info
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        info["url"] = driver.current_url
+        info["title"] = driver.title
+        driver.save_screenshot(os.path.join(DEBUG_DIR, "last_failure.png"))
+        with open(os.path.join(DEBUG_DIR, "last_failure.html"), "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        info["screenshot_saved"] = True
+    except Exception as e:
+        log.error("Could not capture debug info: %s", e)
+    return info
+
+
 def refresh_naukri_profile(triggered_by="scheduled"):
     if not automation_enabled:
         log.info("Automation is paused — skipping this run.")
@@ -163,29 +188,37 @@ def refresh_naukri_profile(triggered_by="scheduled"):
         )
 
     except TimeoutException as e:
-        log.error("Timeout waiting for element: %s", e)
+        debug_info = capture_debug(driver)
+        log.error("Timeout waiting for element: %s | debug: %s", e, debug_info.get("url"))
         update_status(
             state="failed",
             completed=False,
-            message=f"Timed out waiting for a page element: {e}",
+            message=f"Timed out waiting for a page element. Current URL was: {debug_info.get('url')}. Check /api/debug-screenshot",
             last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         send_email(
             "Naukri profile refresh: FAILED (timeout)",
             f"Timed out waiting for a page element. This usually means Naukri's page "
-            f"layout changed, or a CAPTCHA appeared. Manual check needed.\n\nError: {e}",
+            f"layout changed, or a verification/CAPTCHA page appeared instead of the "
+            f"expected page.\n\nURL at time of failure: {debug_info.get('url')}\n"
+            f"Page title: {debug_info.get('title')}\n\n"
+            f"A screenshot was saved — visit /api/debug-screenshot?token=... on your "
+            f"deployed app to see exactly what the browser saw.\n\nError: {e}",
         )
     except Exception as e:
-        log.error("Refresh job failed: %s", e)
+        debug_info = capture_debug(driver)
+        log.error("Refresh job failed: %s | debug: %s", e, debug_info.get("url"))
         update_status(
             state="failed",
             completed=False,
-            message=f"Failed: {e}",
+            message=f"Failed: {e}. Current URL was: {debug_info.get('url')}. Check /api/debug-screenshot",
             last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         send_email(
             "Naukri profile refresh: FAILED",
             f"Automation failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST.\n\n"
+            f"URL at time of failure: {debug_info.get('url')}\n"
+            f"Page title: {debug_info.get('title')}\n\n"
             f"Error: {e}\n\nPlease update your profile manually today.",
         )
     finally:
@@ -434,6 +467,30 @@ def api_resume():
     schedule_next_run()
     log.info("Automation resumed via /api/resume")
     return jsonify({"status": "resumed"})
+
+
+@app.route("/api/debug-screenshot")
+def api_debug_screenshot():
+    """Serves the screenshot captured at the moment of the last failure."""
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+    path = os.path.join(DEBUG_DIR, "last_failure.png")
+    if not os.path.isfile(path):
+        return jsonify({"error": "no debug screenshot available yet"}), 404
+    from flask import send_file
+    return send_file(path, mimetype="image/png")
+
+
+@app.route("/api/debug-html")
+def api_debug_html():
+    """Serves the full page HTML captured at the moment of the last failure."""
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+    path = os.path.join(DEBUG_DIR, "last_failure.html")
+    if not os.path.isfile(path):
+        return jsonify({"error": "no debug HTML available yet"}), 404
+    from flask import send_file
+    return send_file(path, mimetype="text/html")
 
 
 @app.route("/trigger-now")
